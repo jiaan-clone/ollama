@@ -1914,17 +1914,20 @@ func (s *Server) ModelRecommendationsExperimentalHandler(c *gin.Context) {
 	})
 }
 
+// 定义 Serve(ln net.Listener) error。ln 是外面 RunServer 已经创建好的 TCP listener。
+// Serve 做的是：初始化日志和存储，清理模型文件，创建 Server 和路由，启动 scheduler/cache，
+// 探测 GPU，最后启动 HTTP 服务并处理优雅退出。
 func Serve(ln net.Listener) error {
 	slog.SetDefault(logutil.NewLogger(os.Stderr, envconfig.LogLevel()))
 	slog.Info("server config", "env", envconfig.Values())
-	cloudDisabled, _ := internalcloud.Status()
+	cloudDisabled, _ := internalcloud.Status() // 读取 Ollama Cloud 是否禁用，并打印状态。
 	slog.Info(fmt.Sprintf("Ollama cloud disabled: %t", cloudDisabled))
 
-	blobsDir, err := manifest.BlobsPath("")
+	blobsDir, err := manifest.BlobsPath("") // 获取模型 blob 存储目录。如果路径获取失败，直接返回错误。
 	if err != nil {
 		return err
 	}
-	if err := fixBlobs(blobsDir); err != nil {
+	if err := fixBlobs(blobsDir); err != nil { // 调用 fixBlobs(blobsDir) 修复/整理 blob 存储中的兼容性问题。失败则停止启动。
 		return err
 	}
 
@@ -1965,20 +1968,27 @@ func Serve(ln net.Listener) error {
 		}
 	}
 
+	// 调用 s.GenerateRoutes(rc) 生成 HTTP 路由处理器。
+	// 这里会注册 /api/generate、/api/chat、/api/tags、OpenAI 兼容接口等
 	h, err := s.GenerateRoutes(rc)
 	if err != nil {
 		return err
 	}
-
+	// 把刚生成的路由挂到 Go 默认 http.DefaultServeMux 的 / 路径上。
 	http.Handle("/", h)
-
+	// 创建两个可取消 context：
+	// ctx 是 server 总生命周期；schedCtx 是模型调度器生命周期。
 	ctx, done := context.WithCancel(context.Background())
 	schedCtx, schedDone := context.WithCancel(ctx)
+	// 初始化模型调度器，并挂到 s.sched。后面推理请求会通过它加载/复用 runner。
 	sched := InitScheduler(schedCtx)
 	s.sched = sched
+	// 启动模型缓存后台任务。
 	s.modelCaches.Start(ctx)
-
+	// 打印监听地址和 Ollama 版本，例如 Listening on 127.0.0.1:11434。
 	slog.Info(fmt.Sprintf("Listening on %s (version %s)", ln.Addr(), version.Version))
+	// 创建 http.Server。Handler: nil 表示使用默认 http.DefaultServeMux，
+	// 所以前面的 http.Handle("/", h) 会生效。注释里说这样也能顺带暴露 net/http/pprof。
 	srvr := &http.Server{
 		// Use http.DefaultServeMux so we get net/http/pprof for
 		// free.
@@ -1991,9 +2001,12 @@ func Serve(ln net.Listener) error {
 		Handler: nil,
 	}
 
+	// 创建系统信号 channel，并监听 SIGINT、SIGTERM，也就是 Ctrl+C 或进程终止信号。
 	// listen for a ctrl+c and stop any loaded llm
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	// 启动一个 goroutine 等待退出信号。
+	// 收到信号后：关闭 HTTP server、停止 scheduler context、卸载所有模型 runner、取消总 context。
 	go func() {
 		<-signals
 		srvr.Close()
@@ -2002,21 +2015,29 @@ func Serve(ln net.Listener) error {
 		done()
 	}()
 
+	// 启动一个 goroutine 等待退出信号。
+	// 收到信号后：关闭 HTTP server、停止 scheduler context、卸载所有模型 runner、取消总 context。
 	s.sched.Run(schedCtx)
 
+	// 注册 WebP 图片解码器，让多模态输入可以使用 WebP 图片。
 	// register the experimental webp decoder
 	// so webp images can be used in multimodal inputs
 	image.RegisterFormat("webp", "RIFF????WEBP", webp.Decode, webp.DecodeConfig)
 
+	// 启动时探测 GPU 信息，并打印 GPU 详情或警告。
 	// At startup we retrieve GPU information so we can get log messages before loading a model
 	// This will log warnings to the log in case we have problems with detected GPUs
 	gpus := discover.GPUDevices(ctx, nil)
 	discover.LogDetails(gpus)
 
+	// 统计总 VRAM，扣掉 OLLAMA_GPU_OVERHEAD 这类预留开销。
 	var totalVRAM uint64
 	for _, gpu := range gpus {
 		totalVRAM += gpu.TotalMemory - envconfig.GpuOverhead()
 	}
+
+	// 根据总 VRAM 设置默认上下文长度：
+	// 大显存约 47GiB 以上用 262144，约 23GiB 以上用 32768，否则默认 4096。
 
 	// Set default context based on VRAM tier
 	// Use slightly lower thresholds (47/23 GiB vs. 48/24 GiB) to account for small differences in the exact value
@@ -2028,15 +2049,21 @@ func Serve(ln net.Listener) error {
 	default:
 		s.defaultNumCtx = 4096
 	}
+	// 打印基于 VRAM 计算出来的默认上下文长度。
 	slog.Info("vram-based default context", "total_vram", format.HumanBytes2(totalVRAM), "default_num_ctx", s.defaultNumCtx)
 
+	// 真正启动 HTTP server，开始阻塞监听请求。这里会接管前面传入的 ln。
 	err = srvr.Serve(ln)
+
+	// 如果 Serve 返回的不是 http.ErrServerClosed，说明不是正常关闭，直接返回错误。
 	// If server is closed from the signal handler, wait for the ctx to be done
 	// otherwise error out quickly
 	if !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
+	// 如果是正常关闭，则等待 ctx.Done()，确保信号处理里的清理逻辑完成。
 	<-ctx.Done()
+	// 返回 nil，表示 server 正常退出。
 	return nil
 }
 

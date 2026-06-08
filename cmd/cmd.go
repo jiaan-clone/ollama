@@ -709,9 +709,11 @@ func hasListedModelName(models []api.ListModelResponse, name string) bool {
 	return false
 }
 
+// 解析 ollama run 的参数和 flags，查询模型能力，然后按模型类型和运行模式分流到不同执行路径。
 func RunHandler(cmd *cobra.Command, args []string) error {
-	interactive := true
+	interactive := true // 默认认为进入交互模式。比如只执行 ollama run gemma3 时会进入交互。
 
+	// 初始化 runOptions，记录模型名、自动换行、选项 map、是否显示连接提示等。
 	opts := runOptions{
 		Model:       args[0],
 		WordWrap:    os.Getenv("TERM") == "xterm-256color",
@@ -719,12 +721,14 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 		ShowConnect: true,
 	}
 
+	// 读取 --format 参数，比如 --format json，保存到 opts.Format。
 	format, err := cmd.Flags().GetString("format")
 	if err != nil {
 		return err
 	}
 	opts.Format = format
 
+	// 获取 --think flag 对象，用来判断用户是否显式设置过。
 	thinkFlag := cmd.Flags().Lookup("think")
 	if thinkFlag.Changed {
 		thinkStr, err := cmd.Flags().GetString("think")
@@ -753,6 +757,7 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 	}
 	opts.HideThinking = hidethinking
 
+	// 	读取 --keepalive，如果存在就解析成 time.Duration，用于控制模型加载后保留多久。
 	keepAlive, err := cmd.Flags().GetString("keepalive")
 	if err != nil {
 		return err
@@ -765,7 +770,10 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 		opts.KeepAlive = &api.Duration{Duration: d}
 	}
 
+	// 	把模型名后面的参数当作 prompt，比如 ollama run gemma3 hi 中的 hi。
 	prompts := args[1:]
+	// 如果 stdin 不是终端，说明有管道输入，
+	// 例如 cat a.txt | ollama run gemma3，读取 stdin 并拼到 prompt 前面，同时关闭交互模式。
 	// prepend stdin to the prompt if provided
 	if !term.IsTerminal(int(os.Stdin.Fd())) {
 		in, err := io.ReadAll(os.Stdin)
@@ -782,15 +790,17 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 		opts.WordWrap = false
 		interactive = false
 	}
+	// 把所有 prompt 片段用空格拼成一个字符串。
 	opts.Prompt = strings.Join(prompts, " ")
 	if len(prompts) > 0 {
 		interactive = false
 	}
+	// 	如果命令行里已经有 prompt，则不是交互模式。
 	// Be quiet if we're redirecting to a pipe or file
 	if !term.IsTerminal(int(os.Stdout.Fd())) {
 		interactive = false
 	}
-
+	// 读取 --nowordwrap，决定输出时是否自动换行。
 	nowrap, err := cmd.Flags().GetBool("nowordwrap")
 	if err != nil {
 		return err
@@ -799,16 +809,18 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 
 	// Fill out the rest of the options based on information about the
 	// model.
+	// 	创建 API client，连接目标来自 OLLAMA_HOST
 	client, err := api.ClientFromEnvironment()
 	if err != nil {
 		return err
 	}
-
+	// 保存模型名，并判断是否显式请求 cloud 模型。
 	name := args[0]
 	requestedCloud := modelref.HasExplicitCloudSource(name)
-
+	// 调用 /api/show 查询模型信息；如果模型不存在且不是 cloud 模型，则自动 PullHandler 拉取后再查。
 	info, err := func() (*api.ShowResponse, error) {
 		showReq := &api.ShowRequest{Name: name}
+		// client.Show 使用 /api/show 查询模型；不存在则自动 pull
 		info, err := client.Show(cmd.Context(), showReq)
 		var se api.StatusError
 		if errors.As(err, &se) && se.StatusCode == http.StatusNotFound {
@@ -822,7 +834,7 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 		}
 		return info, err
 	}()
-	if err != nil {
+	if err != nil { // 	处理模型查询错误
 		if handleCloudAuthorizationError(err) {
 			return nil
 		}
@@ -830,12 +842,12 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 	}
 
 	ensureCloudStub(cmd.Context(), client, name)
-
+	// 推断 thinking 设置
 	opts.Think, err = inferThinkingOption(&info.Capabilities, &opts, thinkFlag.Changed)
 	if err != nil {
 		return err
 	}
-
+	// 判断 vision/audio 多模态能力
 	audioCapable := slices.Contains(info.Capabilities, model.CapabilityAudio)
 	opts.MultiModal = slices.Contains(info.Capabilities, model.CapabilityVision) || audioCapable
 
@@ -851,9 +863,9 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 			break
 		}
 	}
-
+	// 	应用 /api/show 返回信息
 	applyShowResponseToRunOptions(&opts, info)
-
+	// 	embedding 模型分支
 	// Check if this is an embedding model
 	isEmbeddingModel := slices.Contains(info.Capabilities, model.CapabilityEmbedding)
 
@@ -876,7 +888,7 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 
 		return generateEmbedding(cmd, name, opts.Prompt, opts.KeepAlive, truncate, dimensions)
 	}
-
+	// 	image generation 模型分支
 	// Check if this is an image generation model
 	if slices.Contains(info.Capabilities, model.CapabilityImage) {
 		if opts.Prompt == "" && !interactive {
@@ -884,12 +896,12 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 		}
 		return imagegen.RunCLI(cmd, name, opts.Prompt, interactive, opts.KeepAlive)
 	}
-
+	// 读取 experimental flags
 	// Check for experimental flag
 	isExperimental, _ := cmd.Flags().GetBool("experimental")
 	yoloMode, _ := cmd.Flags().GetBool("experimental-yolo")
 	enableWebsearch, _ := cmd.Flags().GetBool("experimental-websearch")
-
+	// 交互模式分支
 	if interactive {
 		if err := loadOrUnloadModel(cmd, &opts); err != nil {
 			var sErr api.AuthorizationError
@@ -923,6 +935,7 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 
 		return generateInteractive(cmd, opts)
 	}
+	// 	非交互模式，调用 generate(cmd, opts)
 	if err := generate(cmd, opts); err != nil {
 		if handleCloudAuthorizationError(err) {
 			return nil
@@ -1862,148 +1875,238 @@ func chat(cmd *cobra.Command, opts runOptions) (*api.Message, error) {
 	return &api.Message{Role: role, Thinking: thinkingContent.String(), Content: fullResponse.String()}, nil
 }
 
+// generate 是 ollama run MODEL "prompt" 这种非交互式文本生成的执行函数。
+// 它负责构造 /api/generate 请求、处理流式响应、把模型输出打印到终端。
 func generate(cmd *cobra.Command, opts runOptions) error {
+	// 创建 API client，连接地址来自 OLLAMA_HOST，默认指向本地 Ollama server。
 	client, err := api.ClientFromEnvironment()
+	// 如果创建 client 失败，说明环境配置或 client 初始化有问题。
 	if err != nil {
+		// 把错误返回给 Cobra，由上层统一处理并展示给用户。
 		return err
 	}
 
+	// 创建进度管理器，输出到 stderr，避免和模型正文 stdout 混在一起。
 	p := progress.NewProgress(os.Stderr)
+	// 函数退出时清理 spinner/progress，避免终端残留等待状态。
 	defer p.StopAndClear()
 
+	// 创建一个空文本 spinner，用于模型开始响应前的等待提示。
 	spinner := progress.NewSpinner("")
+	// 把 spinner 注册到进度管理器中，开始展示等待状态。
 	p.Add("", spinner)
 
+	// 保存最后一次收到的 /api/generate 响应，后面要用它判断 Done、打印 Summary、保存 Context。
 	var latest api.GenerateResponse
 
+	// 从 Cobra command 的 context 中读取历史 generate context。
 	generateContext, ok := cmd.Context().Value(generateContextKey("context")).([]int)
+	// 如果没有读到，或者类型不是 []int，就说明当前没有可复用的历史 context。
 	if !ok {
+		// 使用空 context，表示这是一次新的生成请求。
 		generateContext = []int{}
 	}
 
+	// 基于命令 context 创建一个可取消 context，传给 HTTP 请求。
 	ctx, cancel := context.WithCancel(cmd.Context())
+	// 函数退出时释放 context 资源。
 	defer cancel()
 
+	// 创建接收系统信号的 channel，缓冲为 1，避免信号发送方阻塞。
 	sigChan := make(chan os.Signal, 1)
+	// 监听 SIGINT，也就是用户按 Ctrl+C。
 	signal.Notify(sigChan, syscall.SIGINT)
 
+	// 启动 goroutine，专门等待 Ctrl+C。
 	go func() {
+		// 阻塞等待用户中断信号。
 		<-sigChan
+		// 收到 Ctrl+C 后取消当前生成请求。
 		cancel()
 	}()
 
+	// 创建输出状态，用于 displayResponse 做自动换行时记录行长和单词缓冲。
 	var state *displayResponseState = &displayResponseState{}
+	// 用 strings.Builder 累计 thinking 内容，便于判断末尾是否已有换行。
 	var thinkingContent strings.Builder
+	// 标记 thinking 输出块是否已经开始。
 	var thinkTagOpened bool = false
+	// 标记 thinking 输出块是否已经结束。
 	var thinkTagClosed bool = false
 
+	// stdout 不是终端时，说明输出可能被重定向或管道消费，此时使用纯文本格式。
 	plainText := !term.IsTerminal(int(os.Stdout.Fd()))
 
+	// 定义流式响应回调；client.Generate 每收到一段 api.GenerateResponse 都会调用它。
 	fn := func(response api.GenerateResponse) error {
+		// 保存最新响应，供函数后半段判断 Done、Summary 和 Context。
 		latest = response
+		// 取出本段响应中的普通正文内容。
 		content := response.Response
 
+		// 一旦有正文输出，或者 thinking 没有被隐藏，就清理等待 spinner。
 		if response.Response != "" || !opts.HideThinking {
+			// 停止并清理进度显示，避免 spinner 和模型输出交错。
 			p.StopAndClear()
 		}
 
+		// 如果本段响应包含 thinking，并且用户没有选择隐藏 thinking。
 		if response.Thinking != "" && !opts.HideThinking {
+			// 如果 thinking 块还没打开，需要先打印 opening 文本。
 			if !thinkTagOpened {
+				// 打印 Thinking...，终端模式下会带颜色，纯文本模式下不带颜色。
 				fmt.Print(thinkingOutputOpeningText(plainText))
+				// 标记 thinking 块已经打开。
 				thinkTagOpened = true
+				// 标记 thinking 块尚未关闭。
 				thinkTagClosed = false
 			}
+			// 把本段 thinking 内容追加到累计缓冲。
 			thinkingContent.WriteString(response.Thinking)
+			// 把本段 thinking 内容打印到终端。
 			displayResponse(response.Thinking, opts.WordWrap, state)
 		}
 
+		// 如果 thinking 已打开且未关闭，并且正文或 tool calls 已经出现，说明 thinking 阶段结束。
 		if thinkTagOpened && !thinkTagClosed && (content != "" || len(response.ToolCalls) > 0) {
+			// 如果 thinking 内容末尾没有换行，先补一个换行，让结束提示另起一行。
 			if !strings.HasSuffix(thinkingContent.String(), "\n") {
+				// 打印换行。
 				fmt.Println()
 			}
+			// 打印 ...done thinking. 结束提示。
 			fmt.Print(thinkingOutputClosingText(plainText))
+			// 标记 thinking 块不再处于打开状态。
 			thinkTagOpened = false
+			// 标记 thinking 块已经关闭。
 			thinkTagClosed = true
+			// 重置输出状态，避免 thinking 的自动换行状态影响正文输出。
 			state = &displayResponseState{}
 		}
 
+		// 打印本段普通正文内容。
 		displayResponse(content, opts.WordWrap, state)
 
+		// 如果响应里包含 tool calls 字段。
 		if response.ToolCalls != nil {
+			// 保存 tool calls 到局部变量，便于后续判断和渲染。
 			toolCalls := response.ToolCalls
+			// 如果 tool calls 列表非空。
 			if len(toolCalls) > 0 {
+				// 格式化并打印 tool calls。
 				fmt.Print(renderToolCalls(toolCalls, plainText))
 			}
 		}
 
+		// 回调成功处理本段响应，返回 nil 让流式读取继续。
 		return nil
 	}
 
+	// 如果模型是多模态模型，需要从 prompt 中提取图片等文件输入。
 	if opts.MultiModal {
+		// extractFileData 会返回清理后的 prompt 和提取出的图片数据。
 		opts.Prompt, opts.Images, err = extractFileData(opts.Prompt)
+		// 如果文件读取或解析失败。
 		if err != nil {
+			// 返回错误，终止生成。
 			return err
 		}
 	}
 
+	// 如果用户传入 --format json。
 	if opts.Format == "json" {
+		// GenerateRequest.Format 是 json.RawMessage，所以要把 json 包成合法 JSON 字符串 "json"。
 		opts.Format = `"` + opts.Format + `"`
 	}
 
+	// 构造 /api/generate 的请求体。
 	request := api.GenerateRequest{
-		Model:     opts.Model,
-		Prompt:    opts.Prompt,
-		Context:   generateContext,
-		Images:    opts.Images,
-		Format:    json.RawMessage(opts.Format),
-		System:    opts.System,
-		Options:   opts.Options,
+		// 要运行的模型名。
+		Model: opts.Model,
+		// 用户输入的 prompt。
+		Prompt: opts.Prompt,
+		// 上一次 /api/generate 返回的上下文 token。
+		Context: generateContext,
+		// 多模态输入中的图片数据。
+		Images: opts.Images,
+		// 输出格式，例如 "json" 或 JSON schema。
+		Format: json.RawMessage(opts.Format),
+		// system prompt。
+		System: opts.System,
+		// 模型运行选项，例如 temperature、num_ctx 等。
+		Options: opts.Options,
+		// 模型生成后保持加载的时间。
 		KeepAlive: opts.KeepAlive,
-		Think:     opts.Think,
+		// thinking 开关或 thinking 强度。
+		Think: opts.Think,
 	}
 
+	// 发送 POST /api/generate，并用 fn 逐段处理流式响应。
 	if err := client.Generate(ctx, &request, fn); err != nil {
+		// 如果错误是 context canceled，通常表示用户按了 Ctrl+C。
 		if errors.Is(err, context.Canceled) {
+			// 用户主动取消不当作失败。
 			return nil
 		}
+		// 其他错误原样返回。
 		return err
 	}
 
+	// 如果本次请求有 prompt。
 	if opts.Prompt != "" {
+		// 输出一个空行，让模型回答和后续终端提示隔开。
 		fmt.Println()
+		// 再输出一个空行，保持 CLI 输出间距。
 		fmt.Println()
 	}
 
+	// 如果最后一段响应没有标记 Done。
 	if !latest.Done {
+		// 说明没有完整结束信息，直接返回。
 		return nil
 	}
 
+	// 读取 --verbose flag，决定是否打印生成统计信息。
 	verbose, err := cmd.Flags().GetBool("verbose")
+	// 如果读取 flag 失败。
 	if err != nil {
+		// 返回错误。
 		return err
 	}
 
+	// 如果用户开启了 verbose。
 	if verbose {
+		// 打印 token 数、耗时等统计摘要。
 		latest.Summary()
 	}
 
+	// 把最新响应中的 Context 写入新的 context，供后续连续生成复用。
 	ctx = context.WithValue(cmd.Context(), generateContextKey("context"), latest.Context)
+	// 把带有最新 generate context 的 context 设置回 Cobra command。
 	cmd.SetContext(ctx)
 
+	// 函数成功结束。
 	return nil
 }
 
+// RunServer 做三件事：准备 keypair，监听 Ollama 地址端口，把 listener 交给 server.Serve 启动服务。
 func RunServer(_ *cobra.Command, _ []string) error {
+	// 启动 server 前，先确保本机有 Ollama 的 SSH keypair。
+	// 也就是 ~/.ollama/id_ed25519 和 ~/.ollama/id_ed25519.pub。如果不存在，会生成。
 	if err := initializeKeypair(); err != nil {
 		return err
 	}
-
+	// 创建 TCP 监听器。envconfig.Host().Host 读取监听地址，来源是 OLLAMA_HOST 环境变量，
+	// 默认一般是 127.0.0.1:11434。
 	ln, err := net.Listen("tcp", envconfig.Host().Host)
 	if err != nil {
 		return err
 	}
-
+	// 把刚才创建的 listener 交给 server 层。
+	// 这里开始真正启动 Ollama HTTP server，注册 API 路由、模型管理、推理调度等逻辑。
 	err = server.Serve(ln)
+	// 判断 server 是否是“正常关闭”。Go 的 HTTP server 被主动关闭时，
+	// 常见返回值就是 http.ErrServerClosed
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
@@ -2057,6 +2160,8 @@ func initializeKeypair() error {
 	return nil
 }
 
+// CLI 命令执行前的 server 存活检查，
+// 避免后续 run/pull/show/list 等命令在没有 Ollama server 的情况下继续执行。
 func checkServerHeartbeat(cmd *cobra.Command, _ []string) error {
 	client, err := api.ClientFromEnvironment()
 	if err != nil {
@@ -2331,6 +2436,16 @@ func launcherActionExitsLoop(integration string) bool {
 	}
 }
 
+/*
+**
+* NewCLI() (line 2334) 的作用是构建并返回 Ollama 的 Cobra CLI 根命令。
+* 它本身不真正执行命令，而是把 ollama 命令行程序的命令树、参数、帮助信息和执行处理函数都注册好，
+*  最后交给 main.go (line 12) 里的：cobra 。
+* 核心职责为：1. 初始化 CLI 基础行为；
+*	2. 定义根命令默认行为；
+ 3. 注册主要子命令，如：serve/start（启动Ollama服务）、run（运行模型）、pull（拉取模型）等；
+ 4. 给命令绑定参数；
+*/
 func NewCLI() *cobra.Command {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	cobra.EnableCommandSorting = false
@@ -2338,7 +2453,7 @@ func NewCLI() *cobra.Command {
 	if runtime.GOOS == "windows" && term.IsTerminal(int(os.Stdout.Fd())) {
 		console.ConsoleFromFile(os.Stdin) //nolint:errcheck
 	}
-
+	// cobra.Command 可以理解成“一个命令节点”。Ollama 用它把整个 CLI 组织成一棵命令树，rootCmd 是命令树的根
 	rootCmd := &cobra.Command{
 		Use:           "ollama",
 		Short:         "Large language model runner",
@@ -2432,11 +2547,11 @@ func NewCLI() *cobra.Command {
 	}
 
 	serveCmd := &cobra.Command{
-		Use:     "serve",
-		Aliases: []string{"start"},
-		Short:   "Start Ollama",
-		Args:    cobra.ExactArgs(0),
-		RunE:    RunServer,
+		Use:     "serve",            // 定义命令名和用法。用户可以执行：ollama serve
+		Aliases: []string{"start"},  // 定义别名。也就是说下面两个命令等价：ollama serve = ollama start
+		Short:   "Start Ollama",     // 命令的简短说明，会出现在 help 里
+		Args:    cobra.ExactArgs(0), // 参数数量校验。serve 不允许额外位置参数，所以ollama serve 合法。ollama serve abc 不合法，因为多了一个参数。
+		RunE:    RunServer,          // 真正执行命令的函数。RunE 的 E 表示会返回 error。当用户运行：ollama serve ，Cobra 最终会调用： RunServer(cmd, args)
 	}
 
 	pullCmd := &cobra.Command{
