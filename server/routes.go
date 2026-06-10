@@ -202,43 +202,65 @@ func usesAutomaticNumBatch(model *Model, requestOpts map[string]any) bool {
 
 // scheduleRunner schedules a runner after validating inputs such as capabilities and model options.
 // It returns the allocated runner, model instance, and consolidated options if successful and error otherwise.
+// scheduleRunner 是 server API handler 和底层模型 runner 之间的调度适配层，
+// 负责把“我要用某个模型推理”变成“这里有一个已经准备好的 runner 可以调用”。
 func (s *Server) scheduleRunner(ctx context.Context, name string, caps []model.Capability, requestOpts map[string]any, keepAlive *api.Duration, shift *bool) (llm.LlamaServer, *Model, *api.Options, error) {
+	// name 是请求要运行的模型名；为空说明调用方没有提供必需的 model 参数。
 	if name == "" {
+		// 返回 errRequired，让上层把它转换成合适的 API 错误。
 		return nil, nil, nil, fmt.Errorf("model %w", errRequired)
 	}
 
+	// 根据模型名读取本地模型元信息，包括模型路径、模板、能力、默认 options 等。
 	model, err := GetModel(name)
+	// 如果模型不存在或模型信息读取失败，直接把错误交给上层处理。
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
+	// 旧版 llama3.2-vision 这类 mllama 模型已经不兼容当前 Ollama，需要提示用户重新 pull。
 	if slices.Contains(model.Config.ModelFamilies, "mllama") && len(model.ProjectorPaths) > 0 {
 		return nil, nil, nil, fmt.Errorf("'llama3.2-vision' is no longer compatible with your version of Ollama and has been replaced by a newer version. To re-download, run 'ollama pull llama3.2-vision'")
 	}
 
+	// 校验模型是否具备调用方要求的能力，例如 completion、insert、thinking 等。
 	if err := model.CheckCapabilities(caps...); err != nil {
+		// 给能力错误补上模型名，方便用户知道哪个模型不支持当前请求。
 		return nil, nil, nil, fmt.Errorf("%s %w", name, err)
 	}
 
 	// Deprecated runner override option; ignore if present.
+	// 兼容旧请求参数：use_imagegen_runner 已废弃，调度 runner 时直接忽略。
 	delete(requestOpts, "use_imagegen_runner")
 
+	// 判断 num_ctx 是否应该由 scheduler/runner 根据模型和硬件自动决定。
 	numCtxAuto := usesAutomaticNumCtx(model, requestOpts)
+	// embedding 模型在没有显式 num_batch 时会使用专门的 batch 默认值。
 	embeddingBatchDefault := shouldApplyEmbeddingBatchDefault(model, requestOpts)
+	// 判断 num_batch 是否自动决定；如果已经应用 embedding 默认值，就不再算作普通自动 batch。
 	numBatchAuto := usesAutomaticNumBatch(model, requestOpts) && !embeddingBatchDefault
+	// 合并模型默认 options、请求 options 和 embedding batch 默认值，得到最终运行参数。
 	opts, err := s.modelOptionsWithEmbeddingBatchDefault(model, requestOpts, embeddingBatchDefault)
+	// options 解析或校验失败时，停止调度并返回错误。
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
+	// 向 scheduler 请求 runner。scheduler 会复用已加载 runner，或排队加载新的 runner。
 	runnerCh, errCh := s.sched.getRunner(ctx, model, opts, keepAlive, numCtxAuto, numBatchAuto, shift)
+	// runnerRef 包装了实际 llm runner、模型信息、引用计数、过期计时器等运行时状态。
 	var runner *runnerRef
+	// 等待 scheduler 返回可用 runner，或返回加载/调度错误。
 	select {
+	// 成功时，runnerCh 会返回已经加载并可用的 runner。
 	case runner = <-runnerCh:
+	// 失败时，errCh 会返回队列、能力、加载、显存等错误。
 	case err = <-errCh:
 		return nil, nil, nil, err
 	}
 
+	// 返回实际 LlamaServer 接口、模型元信息，以及最终 options。
+	// 调用方随后会用 runner.llama.Completion/Embedding 等方法执行推理。
 	return runner.llama, model, &opts, nil
 }
 
@@ -253,9 +275,29 @@ func signinURL() (string, error) {
 	return fmt.Sprintf(signinURLStr, url.PathEscape(h), encKey), nil
 }
 
+/*
+*
+GenerateHandler 是 /api/generate 的 server 侧总调度器：
+它负责解析请求、定位模型、处理 cloud/remote/image/load/unload 分支、
+准备 prompt、调度 runner、调用 Completion，
+最后把 runner 的流式输出转换成 /api/generate 的响应。
+GenerateHandler 调用模型推理的设计是：
+
+	先通过 scheduleRunner 拿到模型 runner，
+	再把请求渲染成模型可用的 prompt/media，
+	然后调用 r.Completion 触发真实推理，
+	通过回调接收 runner 的流式输出，
+	再转换成 /api/generate 的响应格式，
+	最后按 stream 参数选择流式或非流式返回。
+*/
 func (s *Server) GenerateHandler(c *gin.Context) {
+	// 记录请求进入 GenerateHandler 的时间，后面用于计算 TotalDuration 和 LoadDuration。
 	checkpointStart := time.Now()
+
+	// req 用来承接客户端 POST /api/generate 传入的 JSON 请求体。
 	var req api.GenerateRequest
+
+	// 解析请求 JSON。空 body 和 JSON 格式错误都直接返回 400。
 	if err := c.ShouldBindJSON(&req); errors.Is(err, io.EOF) {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "missing request body"})
 		return
@@ -264,17 +306,20 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		return
 	}
 
+	// top_logprobs 是对外 API 参数，这里限制在 llama-server 支持的合理范围内。
 	if req.TopLogprobs < 0 || req.TopLogprobs > 20 {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "top_logprobs must be between 0 and 20"})
 		return
 	}
 
+	// 解析并校验模型引用，区分本地模型、cloud 模型等来源信息。
 	modelRef, err := parseAndValidateModelRef(req.Model)
 	if err != nil {
 		writeModelRefParseError(c, err, http.StatusNotFound, fmt.Sprintf("model '%s' not found", req.Model))
 		return
 	}
 
+	// 显式 cloud 模型不在本地 runner 执行，直接代理到 cloud 推理服务。
 	if modelRef.Source == modelSourceCloud {
 		// TODO(drifkin): evaluate an `/api/*` passthrough for cloud where the
 		// original body (modulo model name normalization) is sent to cloud.
@@ -283,16 +328,19 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		return
 	}
 
+	// 取出解析后的模型名，后面用它在本地模型存储中查找实际模型。
 	name := modelRef.Name
 
 	// We cannot currently consolidate this into GetModel because all we'll
 	// induce infinite recursion given the current code structure.
+	// getExistingName 会处理大小写、tag 等解析细节，找到本地实际存在的模型名。
 	name, err = getExistingName(name)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' not found", req.Model)})
 		return
 	}
 
+	// 读取模型元信息，包括配置、模板、能力、权重路径、remote 配置等。
 	m, err := GetModel(name.String())
 	if err != nil {
 		switch {
@@ -306,46 +354,57 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		return
 	}
 
+	// 再次校验 top_logprobs，保持进入后续执行路径前的参数合法性。
 	if req.TopLogprobs < 0 || req.TopLogprobs > 20 {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "top_logprobs must be between 0 and 20"})
 		return
 	}
 
+	// 用户显式要求 local 时，不允许把 remote stub 当成本地模型运行。
 	if modelRef.Source == modelSourceLocal && m.Config.RemoteHost != "" && m.Config.RemoteModel != "" {
 		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' not found", req.Model)})
 		return
 	}
 
+	// Remote 模型分支：本地只保存一个模型 stub，真正的 generate 请求转发到远端。
 	if m.Config.RemoteHost != "" && m.Config.RemoteModel != "" {
+		// 如果 cloud/remote 功能被禁用，就拒绝远程推理。
 		if disabled, _ := internalcloud.Status(); disabled {
 			c.JSON(http.StatusForbidden, gin.H{"error": internalcloud.DisabledError(cloudErrRemoteInferenceUnavailable)})
 			return
 		}
 
+		// 保存用户请求中的原始模型名，远端响应回来后再写回响应里。
 		origModel := req.Model
 
+		// 解析模型配置中的远端服务地址。
 		remoteURL, err := url.Parse(m.Config.RemoteHost)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
 
+		// 安全限制：只允许转发到配置允许的 remote host。
 		if !slices.Contains(envconfig.Remotes(), remoteURL.Hostname()) {
 			slog.Info("remote model", "remotes", envconfig.Remotes(), "remoteURL", m.Config.RemoteHost, "hostname", remoteURL.Hostname())
 			c.JSON(http.StatusBadRequest, gin.H{"error": "this server cannot run this remote model"})
 			return
 		}
 
+		// 远端真正识别的是 RemoteModel，因此请求发出前要替换模型名。
 		req.Model = m.Config.RemoteModel
 
+		// 请求没有指定 template 时，继承本地 stub 中记录的 template。
 		if req.Template == "" && m.Template.String() != "" {
 			req.Template = m.Template.String()
 		}
 
+		// Options 为空时先初始化，方便下面合并模型默认参数。
 		if req.Options == nil {
 			req.Options = map[string]any{}
 		}
 
+		// 合并模型默认 options，但不覆盖用户请求里显式设置的 option。
 		for k, v := range m.Options {
 			if _, ok := req.Options[k]; !ok {
 				req.Options[k] = v
@@ -353,40 +412,50 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		}
 
 		// update the system prompt from the model if one isn't already specified
+		// 请求没有 system prompt 时，继承模型自带 system prompt。
 		if req.System == "" && m.System != "" {
 			req.System = m.System
 		}
 
+		// /api/generate 没有完整 chat messages 语义；模型内嵌 messages 更适合 /api/chat。
 		if len(m.Messages) > 0 {
 			slog.Warn("embedded messages in the model not supported with '/api/generate'; try '/api/chat' instead")
 		}
 
+		// 根据 stream 参数决定响应 Content-Type。
 		contentType := "application/x-ndjson"
 		if req.Stream != nil && !*req.Stream {
 			contentType = "application/json; charset=utf-8"
 		}
 		c.Header("Content-Type", contentType)
 
+		// 远端 generate 的每段响应都会进入这个回调，再被转写给当前客户端。
 		fn := func(resp api.GenerateResponse) error {
+			// 对用户保持原始模型名，同时附加 remote 信息用于说明实际执行位置。
 			resp.Model = origModel
 			resp.RemoteModel = m.Config.RemoteModel
 			resp.RemoteHost = m.Config.RemoteHost
 
+			// 把远端响应编码成 JSON。
 			data, err := json.Marshal(resp)
 			if err != nil {
 				return err
 			}
 
+			// 按 NDJSON 形式写回当前 HTTP 响应。
 			if _, err = c.Writer.Write(append(data, '\n')); err != nil {
 				return err
 			}
+			// 立即 flush，保持流式响应的实时性。
 			c.Writer.Flush()
 			return nil
 		}
 
+		// 创建指向 remote host 的 API client，并转发 /api/generate 请求。
 		client := api.NewClient(remoteURL, http.DefaultClient)
 		err = client.Generate(c, &req, fn)
 		if err != nil {
+			// 远端需要授权时，返回 signin_url 给客户端。
 			var authError api.AuthorizationError
 			if errors.As(err, &authError) {
 				sURL, sErr := signinURL()
@@ -399,19 +468,23 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 				c.JSON(authError.StatusCode, gin.H{"error": "unauthorized", "signin_url": sURL})
 				return
 			}
+			// 远端返回 API 状态错误时，保留远端状态码和错误体。
 			var apiError api.StatusError
 			if errors.As(err, &apiError) {
 				c.JSON(apiError.StatusCode, apiError)
 				return
 			}
+			// 其他错误按内部错误返回。
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
 
+		// remote 分支已经完成响应写入，不再进入本地 runner 流程。
 		return
 	}
 
 	// expire the runner if unload is requested (empty prompt, keep alive is 0)
+	// 空 prompt 且 keep_alive=0 表示用户只想卸载模型 runner。
 	if req.Prompt == "" && req.KeepAlive != nil && req.KeepAlive.Duration == 0 {
 		s.sched.expireRunner(m)
 
@@ -426,17 +499,21 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 	}
 
 	// Handle image generation models
+	// 图片生成模型有独立处理流程，不走文本 completion。
 	if slices.Contains(m.Capabilities(), model.CapabilityImage) {
 		s.handleImageGenerate(c, req, name.String(), checkpointStart)
 		return
 	}
 
+	// raw 模式表示调用方已经自己准备好 prompt，因此不能再混用 template/system/context。
 	if req.Raw && (req.Template != "" || req.System != "" || len(req.Context) > 0) {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "raw mode does not support template, system, or context"})
 		return
 	}
 
+	// builtinParser 用于模型内置输出协议解析，例如 thinking/tool 等结构化片段。
 	var builtinParser parsers.Parser
+	// Harmony 模型需要使用 harmony parser，并把 max thinking 映射成 harmony 支持的 high。
 	if shouldUseHarmony(m) {
 		// harmony's Reasoning field only understands low/medium/high; map "max" to "high"
 		if req.Think != nil {
@@ -449,6 +526,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		}
 	}
 
+	// 非 raw 模式下，模型配置了 parser 就初始化内置 parser。
 	if !req.Raw && m.Config.Parser != "" {
 		builtinParser = parsers.ParserForName(m.Config.Parser)
 		if builtinParser != nil {
@@ -457,15 +535,19 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		}
 	}
 
+	// /api/generate 的基础要求是模型支持 completion。
 	caps := []model.Capability{model.CapabilityCompletion}
+	// suffix 表示 fill-in-middle/insert 类请求，因此额外要求 insert 能力。
 	if req.Suffix != "" {
 		caps = append(caps, model.CapabilityInsert)
 	}
 
+	// 根据模型能力处理 thinking：支持则加入能力要求，不支持却显式请求则报错。
 	modelCaps := m.Capabilities()
 	if slices.Contains(modelCaps, model.CapabilityThinking) {
 		caps = append(caps, model.CapabilityThinking)
 		if req.Think == nil {
+			// 支持 thinking 的模型默认开启 thinking。
 			req.Think = &api.ThinkValue{Value: true}
 		}
 	} else {
@@ -475,18 +557,22 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		}
 	}
 
+	// 调度 runner：加载或复用模型进程，并返回实际 runner、模型信息和最终 options。
 	r, m, opts, err := s.scheduleRunner(c.Request.Context(), name.String(), caps, req.Options, req.KeepAlive, req.Shift)
 	if errors.Is(err, errCapabilityCompletion) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("%q does not support generate", req.Model)})
 		return
 	} else if err != nil {
+		// 统一处理加载失败、队列满、OOM 等调度错误。
 		handleScheduleError(c, req.Model, err)
 		return
 	}
 
+	// 记录 runner 可用的时间点，用于最终响应里的 LoadDuration。
 	checkpointLoaded := time.Now()
 
 	// load the model
+	// 空 prompt 且不是卸载请求时，表示只加载模型，不生成内容。
 	if req.Prompt == "" {
 		c.JSON(http.StatusOK, api.GenerateResponse{
 			Model:      req.Model,
@@ -497,20 +583,27 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		return
 	}
 
+	// mllama 当前只支持一张图片，多图直接拒绝。
 	if slices.Contains(m.Config.ModelFamilies, "mllama") && len(req.Images) > 1 {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "this model only supports one image while more than one image requested"})
 		return
 	}
 
+	// 把 API 层图片数据转换成 llm 层 CompletionRequest 使用的 MediaData。
 	media := make([]llm.MediaData, len(req.Images))
 	for i := range req.Images {
 		media[i] = llm.NewMediaData(i, req.Images[i])
 	}
 
+	// prompt 初始值是用户请求里的原始 prompt；后面非 raw 模式会改成模板渲染后的 prompt。
 	prompt := req.Prompt
+	// leadingBOS 记录 Go 模板渲染时可能已经输出的 BOS，避免 runner 侧重复处理。
 	var leadingBOS string
+	// 非 raw 模式需要根据模型模板、system、messages、thinking 等信息渲染最终 prompt。
 	if !req.Raw {
+		// 默认使用模型自带模板。
 		tmpl := m.Template
+		// 如果请求显式传入 template，则优先使用请求中的 template。
 		if req.Template != "" {
 			tmpl, err = template.Parse(req.Template)
 			if err != nil {
@@ -519,29 +612,38 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 			}
 		}
 
+		// values 是模板渲染输入。
 		var values template.Values
+		// suffix 不为空时是 insert/fill-in-middle 模式。
 		if req.Suffix != "" {
 			values.Prompt = prompt
 			values.Suffix = req.Suffix
 		} else {
+			// 普通 generate 会被组织成 chat-like messages，方便复用聊天模板/renderer。
 			var msgs []api.Message
+			// 请求指定 system 时优先使用请求的 system。
 			if req.System != "" {
 				msgs = append(msgs, api.Message{Role: "system", Content: req.System})
 			} else if m.System != "" {
+				// 否则使用模型自带 system。
 				msgs = append(msgs, api.Message{Role: "system", Content: m.System})
 			}
 
+			// 只有没有旧版 context 时才合并模型内嵌 messages，避免重复上下文。
 			if req.Context == nil {
 				msgs = append(msgs, m.Messages...)
 			}
 
+			// 把 generate 的 prompt 包成一条 user message。
 			userMsg := api.Message{Role: "user", Content: req.Prompt}
+			// 把图片数据附加到 user message 上。
 			for _, m := range media {
 				userMsg.Images = append(userMsg.Images, m.Data)
 			}
 			values.Messages = append(msgs, userMsg)
 		}
 
+		// 把 thinking 设置写入模板变量。
 		values.Think = req.Think != nil && req.Think.Bool()
 		values.ThinkLevel = ""
 		if req.Think != nil {
@@ -549,7 +651,9 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		}
 		values.IsThinkSet = req.Think != nil
 
+		// b 用来累计最终渲染出的 prompt。
 		var b bytes.Buffer
+		// req.Context 是旧版 generate 上下文；先 detokenize 成文本再拼到 prompt 前。
 		if req.Context != nil {
 			slog.Warn("the context field is deprecated and will be removed in a future version of Ollama")
 			s, err := r.Detokenize(c.Request.Context(), req.Context)
@@ -565,6 +669,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		// TEMP(drifkin): we should really just detect the chat-like flow and call
 		// the real chat handler, but doing this as a stopgap to get renderer
 		// support for generate
+		// 普通 generate 在这里复用 chatPrompt，让模型内置 renderer/chat template 生效。
 		if values.Messages != nil && values.Suffix == "" && req.Template == "" {
 			genTruncate := (req.Truncate == nil || *req.Truncate) && !m.IsMLX()
 			prompt, media, err = chatPrompt(c.Request.Context(), m, r.Tokenize, optionsForPrompt(opts, r), values.Messages, []api.Tool{}, req.Think, genTruncate)
@@ -573,23 +678,28 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 				return
 			}
 			// TEMP(drifkin): req.Context will be removed very soon, but we're temporarily supporting it in this flow here
+			// 如果请求带旧版 context，就把 detokenize 出来的文本和 chatPrompt 结果拼起来。
 			if req.Context != nil {
 				b.WriteString(prompt)
 				prompt = b.String()
 			}
+			// 记录当前模型的 BOS 处理情况。
 			leadingBOS = leadingBOSForModel(m)
 		} else {
 			// Direct template execution flow.
+			// insert/raw-template 等场景直接执行模板生成 prompt。
 			if err := tmpl.Execute(&b, values); err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 				return
 			}
 
+			// 使用直接模板执行得到的结果作为最终 prompt。
 			prompt = b.String()
 		}
 	}
 
 	// If debug mode is enabled, return the rendered template instead of calling the model
+	// DebugRenderOnly 用于调试模板渲染，只返回 prompt，不真正调用 runner。
 	if req.DebugRenderOnly {
 		c.JSON(http.StatusOK, api.GenerateResponse{
 			Model:     req.Model,
@@ -602,7 +712,9 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		return
 	}
 
+	// thinkingState 是通用 thinking 标签解析器，用于没有 builtinParser 的模型。
 	var thinkingState *thinking.Parser
+	// 有 builtinParser 时由 builtinParser 负责解析 thinking；否则尝试从模板推断 thinking 标签。
 	if builtinParser == nil {
 		openingTag, closingTag := thinking.InferTags(m.Template.Template)
 		if req.Think != nil && req.Think.Bool() && openingTag != "" && closingTag != "" {
@@ -610,29 +722,37 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 				OpeningTag: openingTag,
 				ClosingTag: closingTag,
 			}
+			// 如果 prompt 本身已经以 opening tag 结尾，先把这个状态喂给 parser。
 			if strings.HasSuffix(strings.TrimSpace(prompt), openingTag) {
 				thinkingState.AddContent(openingTag)
 			}
 		}
 	}
 
+	// ch 用来把 runner goroutine 中产生的响应或错误传给 HTTP 响应逻辑。
 	ch := make(chan any)
+	// 推理在 goroutine 中执行，外层可以根据 stream 参数选择流式或聚合式返回。
 	go func() {
 		// TODO (jmorganca): avoid building the response twice both here and below
+		// sb 累计 runner 原始输出，用于生成最终 Context。
 		var sb strings.Builder
+		// goroutine 结束时关闭 channel，通知响应逻辑没有更多数据。
 		defer close(ch)
+		// 调用 runner 的 Completion，真正触发模型推理。r 已经是某个模型对应的 runner。在s.scheduleRunner中分配
+		// r.Completion 是 server 层从“准备请求”进入“真实模型推理”的分界线。
 		if err := r.Completion(c.Request.Context(), llm.CompletionRequest{
-			Prompt:          prompt,
-			Media:           media,
-			Format:          req.Format,
-			Options:         opts,
-			Shift:           req.Shift == nil || *req.Shift,
-			Truncate:        req.Truncate == nil || *req.Truncate,
-			Logprobs:        req.Logprobs,
-			TopLogprobs:     req.TopLogprobs,
-			PreservedTokens: preservedTokensForCompletion(builtinParser),
-			LeadingBOS:      leadingBOS,
+			Prompt:          prompt,                                      // 最终渲染后的 prompt
+			Media:           media,                                       // 图片/多模态输入
+			Format:          req.Format,                                  // json/schema 格式约束
+			Options:         opts,                                        // temperature、num_ctx 等推理参数
+			Shift:           req.Shift == nil || *req.Shift,              // 是否使用上下文滑动/缓存
+			Truncate:        req.Truncate == nil || *req.Truncate,        // prompt 太长时是否截断
+			Logprobs:        req.Logprobs,                                // 是否返回 token 概率
+			TopLogprobs:     req.TopLogprobs,                             // 返回多少个候选 token 概率
+			PreservedTokens: preservedTokensForCompletion(builtinParser), // parser 相关保留 token
+			LeadingBOS:      leadingBOS,                                  // BOS 处理信息，避免重复
 		}, func(cr llm.CompletionResponse) {
+			// 把 llm 层 CompletionResponse 转成 /api/generate 的 GenerateResponse。
 			res := api.GenerateResponse{
 				Model:     req.Model,
 				CreatedAt: time.Now().UTC(),
@@ -647,6 +767,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 				Logprobs: toAPILogprobs(cr.Logprobs),
 			}
 
+			// builtinParser 负责把模型原始输出拆成正文、thinking 和 tool calls。
 			if builtinParser != nil {
 				content, thinking, toolCalls, err := builtinParser.Add(cr.Content, cr.Done)
 				if err != nil {
@@ -659,20 +780,24 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 					res.ToolCalls = toolCalls
 				}
 			} else if thinkingState != nil {
+				// 没有 builtinParser 时，用通用 thinking parser 拆分 thinking 和正文。
 				thinking, content := thinkingState.AddContent(cr.Content)
 				res.Thinking = thinking
 				res.Response = content
 			}
 
+			// 累计原始 completion 内容，用于最终 tokenize 成 GenerateResponse.Context。
 			if _, err := sb.WriteString(cr.Content); err != nil {
 				ch <- gin.H{"error": err.Error()}
 			}
 
+			// runner 标记 Done 时，补充结束原因、耗时和上下文。
 			if cr.Done {
 				res.DoneReason = cr.DoneReason.String()
 				res.TotalDuration = time.Since(checkpointStart)
 				res.LoadDuration = checkpointLoaded.Sub(checkpointStart)
 
+				// raw 模式下不自动生成旧版 context；非 raw 才 tokenize prompt+输出。
 				if !req.Raw {
 					tokens, err := r.Tokenize(c.Request.Context(), prompt+sb.String())
 					if err != nil {
@@ -687,6 +812,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 				// Emit chunks that carry logprobs even if the parser is still buffering
 				// visible content, otherwise generate logprobs disappear for models with
 				// builtin thinking/tool parsers.
+				// parser 可能暂时缓冲可见文本，所以只有包含有效内容/状态/logprobs 时才发给客户端。
 				if res.Response != "" || res.Thinking != "" || res.Done || len(res.ToolCalls) > 0 || len(res.Logprobs) > 0 {
 					ch <- res
 				}
@@ -694,26 +820,36 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 				return
 			}
 
+			// 没有 builtinParser 的普通路径，每段 CompletionResponse 都转发出去。
 			ch <- res
 		}); err != nil {
+			// 推理运行期 OOM 时，通知 scheduler 过期相关 runner，避免继续复用坏状态。
 			s.sched.expireRunnersForRuntimeOOM(m, err)
 			var serr api.StatusError
 			if errors.As(err, &serr) {
+				// runner 返回带状态码的 API 错误时，保留状态码。
 				ch <- gin.H{"error": serr.ErrorMessage, "status": serr.StatusCode}
 			} else {
+				// 其他错误按通用 error 传给响应逻辑。
 				ch <- gin.H{"error": err.Error()}
 			}
 		}
 	}()
 
+	// stream=false 时，server 会先把所有 chunk 聚合，再一次性返回 JSON。
 	if req.Stream != nil && !*req.Stream {
+		// r 保存最后一个 GenerateResponse，其中包含 Done、metrics、context 等最终字段。
 		var r api.GenerateResponse
+		// 非流式响应需要累计所有 chunk 的 logprobs。
 		var allLogprobs []api.Logprob
+		// 分别累计 thinking 和正文内容。
 		var sbThinking strings.Builder
 		var sbContent strings.Builder
+		// 消费 runner goroutine 发到 channel 的所有响应。
 		for rr := range ch {
 			switch t := rr.(type) {
 			case api.GenerateResponse:
+				// 普通响应 chunk：累计 thinking、正文，并保留最新响应作为最终响应基底。
 				sbThinking.WriteString(t.Thinking)
 				sbContent.WriteString(t.Response)
 				r = t
@@ -722,6 +858,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 					allLogprobs = append(allLogprobs, t.Logprobs...)
 				}
 			case gin.H:
+				// 错误响应：从 gin.H 中提取 error 和 status。
 				msg, ok := t["error"].(string)
 				if !ok {
 					msg = "unexpected error format in response"
@@ -735,19 +872,23 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 				c.JSON(status, gin.H{"error": msg})
 				return
 			default:
+				// channel 中出现未知类型，说明内部响应协议异常。
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "unexpected response"})
 				return
 			}
 		}
 
+		// 把累计出的完整 thinking、正文和 logprobs 写回最终响应。
 		r.Thinking = sbThinking.String()
 		r.Response = sbContent.String()
 		r.Logprobs = allLogprobs
 
+		// 非流式模式返回单个 JSON 对象。
 		c.JSON(http.StatusOK, r)
 		return
 	}
 
+	// 默认流式模式：把 channel 中的每段响应按 NDJSON 写回客户端。
 	streamResponse(c, ch)
 }
 
@@ -1858,6 +1999,7 @@ func (s *Server) GenerateRoutes(rc *ollama.Registry) (http.Handler, error) {
 
 	// Inference
 	r.GET("/api/ps", s.PsHandler)
+	// 注册 /api/generate 的 POST 路由，把请求交给 s.GenerateHandler 处理，并可选加上推理请求日志中间件。
 	r.POST("/api/generate", s.withInferenceRequestLogging("/api/generate", s.GenerateHandler)...)
 	r.POST("/api/chat", s.withInferenceRequestLogging("/api/chat", s.ChatHandler)...)
 	r.POST("/api/embed", s.EmbedHandler)

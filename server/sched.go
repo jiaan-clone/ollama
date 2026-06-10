@@ -163,46 +163,75 @@ func effectiveContext(numCtx, trainCtx int) int {
 }
 
 func (s *Scheduler) getRunner(c context.Context, m *Model, opts api.Options, sessionDuration *api.Duration, numCtxAuto bool, numBatchAuto bool, shift *bool) (chan *runnerRef, chan error) {
+	// 如果调用方传入的上下文窗口太小，就提升到调度器允许的最小值 4。
 	if opts.NumCtx < 4 {
+		// 这里直接修改本次请求的 opts 副本，避免后续加载 runner 时拿到无效的 NumCtx。
 		opts.NumCtx = 4
 	}
 
+	// 检查模型是否具备视觉能力；CheckCapabilities 返回 nil 表示能力满足。
 	if m.CheckCapabilities(model.CapabilityVision) == nil {
 		// multimodal models require at least 2048 context
+		// 多模态模型需要更大的上下文窗口，因此把 NumCtx 至少提升到 2048。
 		opts.NumCtx = max(opts.NumCtx, 2048)
 	}
 
+	// 默认关闭 context shift，只有 GGUF/llama-server 类模型路径存在时才会继续解析。
 	contextShift := false
+	// ModelPath 非空表示这是需要 llama runner 按模型文件启动的请求。
 	if m.ModelPath != "" {
+		// shift 显式配置优先生效；未显式配置时，根据 NumCtx 是否小于阈值自动判断。
 		contextShift = resolveContextShift(shift, opts.NumCtx)
 	}
 
+	// 构造调度请求对象，后续要么立即复用已加载 runner，要么送入 pending 队列等待调度。
 	req := &LlmRequest{
-		ctx:             c,
-		model:           m,
-		opts:            opts,
+		// 保存调用方的 context；请求取消时调度器和 runner 引用计数都会依赖它。
+		ctx: c,
+		// 保存本次请求要使用的模型元数据。
+		model: m,
+		// 保存已经规范化后的运行参数。
+		opts: opts,
+		// 保存会话保活时长，用于后续决定 runner 空闲后何时过期。
 		sessionDuration: sessionDuration,
-		successCh:       make(chan *runnerRef, 1),
-		errCh:           make(chan error, 1),
-		numCtxAuto:      numCtxAuto,
-		numBatchAuto:    numBatchAuto,
-		contextShift:    contextShift,
-		shift:           shift,
+		// 成功通道带 1 个缓冲，调度器可以异步返回可用 runner。
+		successCh: make(chan *runnerRef, 1),
+		// 错误通道带 1 个缓冲，队列满或加载失败时可以异步返回错误。
+		errCh: make(chan error, 1),
+		// 记录 NumCtx 是否来自自动推导，后续重试或降级策略会用到。
+		numCtxAuto: numCtxAuto,
+		// 记录 NumBatch 是否来自自动推导，后续重试或降级策略会用到。
+		numBatchAuto: numBatchAuto,
+		// 保存本次请求最终解析出的 context shift 开关。
+		contextShift: contextShift,
+		// 保留原始 shift 指针，便于后续重新构造或重试请求时区分显式配置和自动配置。
+		shift: shift,
 	}
 
+	// 计算 scheduler.loaded 使用的模型键，避免不同来源的模型互相冲突。
 	key := schedulerModelKey(req.model)
+	// 加锁读取已加载 runner map，防止并发加载、卸载时发生数据竞争。
 	s.loadedMu.Lock()
+	// 尝试按模型键找到当前已经加载的 runner。
 	runner := s.loaded[key]
+	// 读取完成后立即解锁，缩短持锁时间。
 	s.loadedMu.Unlock()
+	// 如果 runner 存在，并且它的参数、模型或运行状态不要求重新加载，就可以直接复用。
 	if runner != nil && !runner.needsReload(c, req) {
+		// 复用已有 runner：增加引用并把结果发回 successCh，同时安排请求结束后的释放逻辑。
 		req.useLoadedRunner(runner, s.finishedReqCh)
 	} else {
+		// 没有可复用 runner，或者已有 runner 需要重载时，将请求交给 pending 调度循环。
 		select {
+		// pending 队列有容量时，把请求放入队列，由 processPending 负责加载或重载 runner。
 		case s.pendingReqCh <- req:
+		// pending 队列已满时不阻塞调用方，直接返回最大队列错误。
 		default:
+			// 通过 errCh 通知调用方当前服务繁忙。
 			req.errCh <- ErrMaxQueue
 		}
 	}
+	// 返回成功和错误通道；调用方随后等待其中一个通道给出 runner 或错误。
 	return req.successCh, req.errCh
 }
 
@@ -468,21 +497,35 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 // Complete the pending request and send the runner back to the requester
 // Wires up a finished event after the request context is completed
 // Updates session duration, and resets expiration timer
+// useLoadedRunner 负责复用已加载模型 runner，并把“请求开始使用”和“请求结束释放”的生命周期接入调度器。
 func (pending *LlmRequest) useLoadedRunner(runner *runnerRef, finished chan *LlmRequest) {
+	// 加锁保护 runner 的引用计数、过期定时器和会话时长等共享状态。
 	runner.refMu.Lock()
+	// 函数返回前释放锁，确保下面对 runner 状态的修改是原子的。
 	defer runner.refMu.Unlock()
+	// 当前请求开始使用该 runner，引用计数加一，防止空闲回收流程卸载它。
 	runner.refCount++
+	// 如果 runner 已经设置了过期定时器，说明它之前处于空闲等待卸载状态。
 	if runner.expireTimer != nil {
+		// 停止过期定时器，避免 runner 在本次请求使用期间被触发卸载。
 		runner.expireTimer.Stop()
+		// 清空定时器引用，表示当前 runner 不再处于定时过期状态。
 		runner.expireTimer = nil
 	}
+	// 如果本次请求显式传入了会话保活时长，就覆盖 runner 当前的保活配置。
 	if pending.sessionDuration != nil {
+		// 将请求级别的 keep-alive 时长保存到 runner，供请求结束后的过期逻辑使用。
 		runner.sessionDuration = pending.sessionDuration.Duration
 	}
+	// 把可复用的 runner 发送给等待方，表示调度成功。
 	pending.successCh <- runner
+	// 启动后台协程，等待本次请求的 context 结束。
 	go func() {
+		// 阻塞直到调用方取消 context、请求完成或超时。
 		<-pending.ctx.Done()
+		// 记录请求 context 已结束，便于调试 runner 生命周期。
 		slog.Debug("context for request finished", "runner", runner)
+		// 通知调度器该请求已完成；processCompleted 会递减引用计数并处理过期计时。
 		finished <- pending
 	}()
 }
